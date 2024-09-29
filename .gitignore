@@ -1,2 +1,5 @@
 #Virtual Environment
 tkenv/
+
+# macOS system files
+.DS_Store
