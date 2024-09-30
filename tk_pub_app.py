@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 class PublicationApp:
     def __init__(self, master):
         self.master = master
-        master.title("Publication Viewer 2.4")
-        master.geometry("1200x800")
+        master.title("Publication Viewer 2.6")
+        master.geometry("1200x900")  # Increased height to accommodate the new Treeview
 
         # Frame for Year and Author Filtering
         self.frame_filter = ttk.Frame(master)
@@ -130,7 +130,6 @@ class PublicationApp:
         self.missing_label = ttk.Label(self.missing_frame, text="Missing Publications:")
         self.missing_label.pack()
 
-        columns = ("Title", "Authors", "Year", "DOI")
         self.missing_tree = ttk.Treeview(self.missing_frame, columns=columns, show='headings', height=10)
         for col in columns:
             self.missing_tree.heading(col, text=col)
@@ -141,6 +140,24 @@ class PublicationApp:
         missing_tree_scroll = ttk.Scrollbar(self.missing_frame, orient="vertical", command=self.missing_tree.yview)
         missing_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.missing_tree.configure(yscrollcommand=missing_tree_scroll.set)
+
+        # Extra publications area
+        self.extra_frame = ttk.Frame(master)
+        self.extra_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        self.extra_label = ttk.Label(self.extra_frame, text="Extra Publications (Only in Local BibTeX):")
+        self.extra_label.pack()
+
+        self.extra_tree = ttk.Treeview(self.extra_frame, columns=columns, show='headings', height=10)
+        for col in columns:
+            self.extra_tree.heading(col, text=col)
+            self.extra_tree.column(col, width=200, anchor=tk.W)
+        self.extra_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Add scrollbar to the Extra Treeview
+        extra_tree_scroll = ttk.Scrollbar(self.extra_frame, orient="vertical", command=self.extra_tree.yview)
+        extra_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.extra_tree.configure(yscrollcommand=extra_tree_scroll.set)
 
         # BibTeX text area for missing publications
         self.bibtex_label = ttk.Label(master, text="Missing Publications (BibTeX):")
@@ -373,25 +390,163 @@ class PublicationApp:
 
         return publications
 
+    def fetch_from_semantic_scholar(self, first_name, last_name):
+        publications = []
+        query = f"{first_name} {last_name}"
+
+        try:
+            # Initialize the Semantic Scholar API client
+            api_url = 'https://api.semanticscholar.org/graph/v1/author/search'
+            params = {
+                'query': query,
+                'fields': 'papers.title,papers.year,papers.authors,papers.doi,papers.externalIds',
+                'limit': 1
+            }
+            response = requests.get(api_url, params=params)
+            data = response.json()
+
+            if 'data' in data and data['data']:
+                author_id = data['data'][0]['authorId']
+                self.update_progress(f"Found Semantic Scholar author ID: {author_id}")
+
+                # Fetch papers by author ID
+                papers_url = f'https://api.semanticscholar.org/graph/v1/author/{author_id}/papers'
+                papers_params = {
+                    'fields': 'title,year,authors,doi,externalIds',
+                    'limit': 1000
+                }
+                papers_response = requests.get(papers_url, params=papers_params)
+                papers_data = papers_response.json()
+
+                if 'data' in papers_data:
+                    for paper in papers_data['data']:
+                        # Check if the author matches
+                        if any(self.author_match(query, f"{a.get('name', '')}") for a in paper.get('authors', [])):
+                            pub = {
+                                'title': paper.get('title', ''),
+                                'year': str(paper.get('year', '')),
+                                'author': ', '.join([a.get('name', '') for a in paper.get('authors', [])]),
+                                'doi': paper.get('doi', ''),
+                                'ENTRYTYPE': 'article',
+                                'ID': paper.get('doi', f"SS_{paper.get('paperId', '')}")
+                            }
+                            publications.append(pub)
+        except Exception as e:
+            self.update_progress(f"Error fetching from Semantic Scholar: {str(e)}")
+            logger.exception("Exception in fetch_from_semantic_scholar")
+
+        return publications
+
+    def fetch_from_google_scholar(self, first_name, last_name):
+        publications = []
+        query = f"{first_name} {last_name}"
+
+        try:
+            search_query = scholarly.search_author(query)
+            author = next(search_query, None)
+            if author:
+                author = scholarly.fill(author)
+                for pub in author['publications']:
+                    if 'bib' in pub:
+                        bib = pub['bib']
+                        # Check if the author matches
+                        if self.author_match(query, bib.get('author', '')):
+                            pub_data = {
+                                'title': bib.get('title', ''),
+                                'year': str(bib.get('pub_year', '')),
+                                'author': bib.get('author', ''),
+                                'doi': bib.get('doi', ''),
+                                'ENTRYTYPE': bib.get('ENTRYTYPE', 'article'),
+                                'ID': bib.get('doi', f"GS_{bib.get('title', '')}")
+                            }
+                            publications.append(pub_data)
+        except Exception as e:
+            self.update_progress(f"Error fetching from Google Scholar: {str(e)}")
+            logger.exception("Exception in fetch_from_google_scholar")
+
+        return publications
+
+    def fetch_from_dblp(self, first_name, last_name):
+        publications = []
+        query = f"{first_name} {last_name}"
+        try:
+            url = f'https://dblp.org/search/publ/api?q=author%3A{first_name}%20{last_name}&format=json&h=1000'
+            response = requests.get(url)
+            data = response.json()
+
+            hits = data.get('result', {}).get('hits', {}).get('hit', [])
+            for hit in hits:
+                info = hit.get('info', {})
+                authors = info.get('authors', {}).get('author', [])
+                if isinstance(authors, dict):
+                    authors = [authors]
+                authors_list = [a.get('text', '') for a in authors]
+                # Check if the author matches
+                if any(self.author_match(query, a) for a in authors_list):
+                    pub_data = {
+                        'title': info.get('title', ''),
+                        'year': str(info.get('year', '')),
+                        'author': ', '.join(authors_list),
+                        'doi': info.get('doi', ''),
+                        'ENTRYTYPE': 'article',
+                        'ID': info.get('doi', f"DBLP_{info.get('key', '')}")
+                    }
+                    publications.append(pub_data)
+        except Exception as e:
+            self.update_progress(f"Error fetching from DBLP: {str(e)}")
+            logger.exception("Exception in fetch_from_dblp")
+
+        return publications
+
     def author_match(self, query_author, pub_authors):
-        # Ensure that query_author has both first and last name
+        """
+        Checks if the query_author matches any of the authors in pub_authors.
+
+        The matching is strict:
+        - The last names must match exactly after normalization.
+        - The first name must match exactly or by initial.
+
+        Args:
+            query_author (str): The full name of the author to match (e.g., "Max Mustermann").
+            pub_authors (list or str): The list of authors from the publication.
+
+        Returns:
+            bool: True if a match is found, False otherwise.
+        """
+        # Normalize the query author's name
         normalized_query = self.normalize_author(query_author)
-        parts = normalized_query.split()
-        if len(parts) < 2:
-            return False
-        first_name, last_name = parts[0], ' '.join(parts[1:])
+        query_parts = normalized_query.split()
+        if len(query_parts) < 2:
+            return False  # Not enough information to perform matching
+        query_first_name = query_parts[0]
+        query_last_name = ' '.join(query_parts[1:])
 
+        # Handle the publication authors
         if isinstance(pub_authors, list):
-            # Assuming each item in the list is a dict with 'given' and 'family'
-            pub_authors_str = ', '.join([f"{a.get('given', '')} {a.get('family', '')}" for a in pub_authors])
+            authors_list = [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in pub_authors]
         elif isinstance(pub_authors, str):
-            pub_authors_str = pub_authors
+            authors_list = [name.strip() for name in pub_authors.split(',')]
         else:
-            pub_authors_str = ''
+            authors_list = []
 
-        pub_authors_norm = self.normalize_author(pub_authors_str)
+        # Normalize and check each author in the publication
+        for author in authors_list:
+            normalized_author = self.normalize_author(author)
+            author_parts = normalized_author.split()
+            if len(author_parts) < 2:
+                continue  # Skip if the author's name is incomplete
+            author_first_name = author_parts[0]
+            author_last_name = ' '.join(author_parts[1:])
 
-        return last_name in pub_authors_norm and (first_name in pub_authors_norm or first_name[0] + '.' in pub_authors_norm)
+            # Check if last names match exactly
+            if query_last_name != author_last_name:
+                continue
+
+            # Check if first names match exactly or by initial
+            if (query_first_name == author_first_name) or (query_first_name[0] == author_first_name[0] and len(author_first_name) == 2 and author_first_name[1] == '.'):
+                return True  # Match found
+
+        return False  # No match found
 
     def normalize_author(self, author):
         if isinstance(author, list):
@@ -402,8 +557,12 @@ class PublicationApp:
         if not isinstance(text, str):
             logger.warning(f"normalize_text received non-string input: {type(text)}")
             text = str(text)
-        return ''.join(c for c in unicodedata.normalize('NFKD', text.lower())
-                       if not unicodedata.combining(c))
+        # Remove accents and convert to lowercase
+        text = ''.join(c for c in unicodedata.normalize('NFKD', text) if not unicodedata.combining(c))
+        text = text.lower()
+        # Remove non-alphanumeric characters except for periods
+        text = re.sub(r'[^\w.\s]', '', text)
+        return text.strip()
 
     def parse_crossref_item(self, item):
         pub_authors = []
@@ -472,178 +631,6 @@ class PublicationApp:
             'ID': unique_id  # Use the generated unique ID
         }
         return pub
-
-    def fetch_from_semantic_scholar(self, first_name, last_name):
-        base_url = "https://api.semanticscholar.org/graph/v1/author/search"
-        publications = []
-
-        session = requests.Session()
-        retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-        session.mount('https://', HTTPAdapter(max_retries=retries))
-
-        try:
-            params = {
-                'query': f"{first_name} {last_name}",
-                'fields': 'name,papers.title,papers.year,papers.authors,papers.externalIds,papers.venue'
-            }
-            response = session.get(base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-
-            if 'data' in data:
-                for author in data['data']:
-                    if self.exact_author_match(f"{first_name} {last_name}", author['name']):
-                        for paper in author.get('papers', []):
-                            pub = {
-                                'author': ', '.join([a['name'] for a in paper.get('authors', [])]),
-                                'year': str(paper.get('year', 'Unknown')),
-                                'title': paper.get('title', ''),
-                                'doi': paper.get('externalIds', {}).get('DOI', ''),
-                                'container-title': paper.get('venue', ''),
-                                'publisher': '',
-                                'ENTRYTYPE': 'article',  # Default type
-                                'ID': paper.get('externalIds', {}).get('DOI', f"key{hash(paper.get('title', ''))}")
-                            }
-                            publications.append(pub)
-                        break  # Assuming exact match, stop after first match
-        except Exception as e:
-            self.update_progress(f"Error fetching from Semantic Scholar: {str(e)}")
-            logger.exception("Exception in fetch_from_semantic_scholar")
-
-        return publications
-
-    def fetch_from_google_scholar(self, first_name, last_name):
-        publications = []
-        try:
-            self.update_progress(f"Searching for author: {first_name} {last_name} in Google Scholar...")
-            search_query = scholarly.search_author(f"{first_name} {last_name}")
-            authors = list(search_query)
-
-            def get_author_name(author):
-                if isinstance(author, dict):
-                    return author.get('name', '')
-                return getattr(author, 'name', '')
-
-            exact_match = next((a for a in authors if self.exact_author_match(f"{first_name} {last_name}", get_author_name(a))), None)
-
-            if exact_match:
-                self.update_progress("Author found. Fetching publications...")
-                author = scholarly.fill(exact_match, sections=['basics', 'publications'])
-
-                for i, pub in enumerate(author.get('publications', [])[:20]):
-                    if i % 5 == 0:
-                        self.update_progress(f"Fetched {i} publications...")
-
-                    try:
-                        filled_pub = self.threaded_timeout(scholarly.fill, (pub,), timeout=30)
-                        if filled_pub:
-                            bib = filled_pub.get('bib', {})
-                            publications.append({
-                                'author': ', '.join(bib.get('author', '').split(' and ')),
-                                'year': bib.get('pub_year', 'Unknown'),
-                                'title': bib.get('title', ''),
-                                'doi': filled_pub.get('pub_url', ''),
-                                'container-title': bib.get('journal', ''),
-                                'publisher': '',
-                                'ENTRYTYPE': 'article',  # Default type
-                                'ID': bib.get('pub_year', f"key{hash(bib.get('title', ''))}")  # Use pub_year as ID or generate unique key
-                            })
-                        else:
-                            self.update_progress(f"Timeout while fetching details for publication {i+1}")
-                    except Exception as e:
-                        self.update_progress(f"Error fetching details for publication {i+1}: {str(e)}")
-                        logger.exception(f"Exception fetching publication {i+1} details")
-
-                    time.sleep(1)
-            else:
-                self.update_progress(f"No exact author match found in Google Scholar for: {first_name} {last_name}")
-        except Exception as e:
-            self.update_progress(f"Google Scholar API Request Error for {first_name} {last_name}: {str(e)}")
-            logger.exception("Exception in fetch_from_google_scholar")
-
-        self.update_progress(f"Google Scholar fetch complete. Found {len(publications)} publications.")
-        return publications
-
-    def fetch_from_dblp(self, first_name, last_name):
-        publications = []
-        searches = [
-            f"{first_name} {last_name}",
-            f"{first_name[0]}. {last_name}",
-            last_name
-        ]
-
-        for search_query in searches:
-            try:
-                self.update_progress(f"Searching DBLP for: {search_query}")
-                search_url = f"https://dblp.org/search/publ/api?q={search_query}&format=xml"
-                response = requests.get(search_url)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.content, 'xml')
-                hits = soup.find_all('hit')
-
-                for hit in hits:
-                    info = hit.find('info')
-                    if info:
-                        authors = info.find('authors')
-                        if authors:
-                            author_names = [author.text for author in authors.find_all('author')]
-                            author_str = ', '.join(author_names)
-                        else:
-                            author_str = ''
-
-                        title = info.find('title')
-                        year = info.find('year')
-                        venue = info.find('venue')
-
-                        # Format 'published-online' if available
-                        published_online = info.find('published-online')
-                        if published_online:
-                            published_online_str = published_online.text
-                        else:
-                            published_online_str = 'Unknown'
-
-                        publication = {
-                            'author': author_str,
-                            'year': year.text if year else 'Unknown',
-                            'title': title.text if title else '',
-                            'doi': '',
-                            'container-title': venue.text if venue else '',
-                            'publisher': '',
-                            'ENTRYTYPE': 'article',  # Default type
-                            'ID': f"key{hash(title.text if title else '')}"
-                        }
-
-                        if self.author_match(f"{first_name} {last_name}", publication['author']):
-                            publications.append(publication)
-            except Exception as e:
-                self.update_progress(f"Error fetching from DBLP for {search_query}: {str(e)}")
-                logger.exception("Exception in fetch_from_dblp")
-
-        self.update_progress(f"DBLP fetch complete. Found {len(publications)} publications.")
-        return publications
-
-    def threaded_timeout(self, func, args=(), kwargs={}, timeout=None):
-        result = [None]
-
-        def worker():
-            try:
-                result[0] = func(*args, **kwargs)
-            except Exception as e:
-                result[0] = e
-
-        thread = threading.Thread(target=worker)
-        thread.start()
-        thread.join(timeout)
-        if thread.is_alive():
-            return None
-        if isinstance(result[0], Exception):
-            raise result[0]
-        return result[0]
-
-    def exact_author_match(self, query_name, author_name):
-        query_parts = set(query_name.lower().split())
-        author_parts = set(author_name.lower().split())
-        return query_parts == author_parts
 
     def remove_duplicates(self, publications):
         unique_pubs = []
@@ -736,16 +723,16 @@ class PublicationApp:
         self.master.after(0, lambda: self._display_extra_publications(extra_pubs))
 
     def _display_extra_publications(self, extra_pubs):
-        # Clear any existing entries in the publication tree
-        for item in self.publication_tree.get_children():
-            self.publication_tree.delete(item)
+        # Clear the Extra Treeview
+        for item in self.extra_tree.get_children():
+            self.extra_tree.delete(item)
 
         for _, pub in extra_pubs.iterrows():
             title = pub.get('title', 'No title')
             authors = pub.get('author', 'Unknown author')
             year = pub.get('year', 'Unknown')
             doi = pub.get('doi', '')
-            self.publication_tree.insert('', tk.END, values=(title, authors, year, doi))
+            self.extra_tree.insert('', tk.END, values=(title, authors, year, doi))
 
     def update_statistics(self, local_count, crawled_count, common_count, missing_count, extra_count):
         self.master.after(0, lambda: self._update_statistics(local_count, crawled_count, common_count, missing_count, extra_count))
@@ -862,7 +849,7 @@ class PublicationApp:
             # Read the output and display to the user
             completed_data = self.read_bibtex(output_bib_file)
             if not completed_data.empty:
-                # Display the completed BibTeX entry
+                # Display the autocompleted BibTeX entry
                 self.display_single_bibtex(completed_data)
             else:
                 self.update_progress("No data found in the autocompleted file.")
